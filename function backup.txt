@@ -1,0 +1,160 @@
+// Shortcode for IPO Table
+function fetch_ipo_data() {
+    $cache_key = 'ipo_table_cache';
+    $cached_data = get_transient($cache_key);
+
+    if ($cached_data !== false) {
+        return $cached_data; // Return cached data if available
+    }
+
+    $url = "https://puppeteer-server-production.up.railway.app/scrape?" . time();
+    $response = wp_remote_get($url);
+
+    if (is_wp_error($response)) {
+        return "Error fetching IPO data: " . $response->get_error_message();
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    if (empty($body)) {
+        return "No data available. API returned an empty response.";
+    }
+
+    set_transient($cache_key, $body, 300); // Cache for 5 minutes (300 seconds)
+    return $body;
+}
+
+add_shortcode('ipos', 'fetch_ipo_data');
+
+// Auto Post-Creattion
+function fetch_and_create_ipo_posts() {
+    $scrape_api_url = "https://puppeteer-server-production.up.railway.app/scrape";
+    $cloudflare_base_url = "https://pub-0b15fe86b9f44b00b186441ecded390c.r2.dev/";
+    $category_name = "IPO Details";
+
+    if (!WP_DEBUG_LOG) return;
+
+    error_log("IPO Post Creation Started.");
+
+    $response = wp_remote_get($scrape_api_url);
+    if (is_wp_error($response)) {
+        error_log("API Request Failed: " . $response->get_error_message());
+        return;
+    }
+    $html = wp_remote_retrieve_body($response);
+    if (!$html) {
+        error_log("Empty Response from API.");
+        return;
+    }
+    error_log("Successfully fetched table HTML.");
+
+    libxml_use_internal_errors(true);
+    $dom = new DOMDocument();
+    $dom->loadHTML($html);
+    $xpath = new DOMXPath($dom);
+
+    $headers = $xpath->query("//table//tr[1]/th");
+    $issuer_col_index = -1;
+    foreach ($headers as $index => $header) {
+        if (trim($header->nodeValue) === "Issuer Company") {
+            $issuer_col_index = $index + 1;
+            break;
+        }
+    }
+    if ($issuer_col_index == -1) {
+        error_log("Issuer Company column not found.");
+        return;
+    }
+    error_log("Issuer Company column found at index: " . $issuer_col_index);
+
+    $rows = $xpath->query("//table//tbody/tr");
+    $titles = [];
+    foreach ($rows as $row) {
+        $issuer = $xpath->query("td[$issuer_col_index]", $row);
+        if ($issuer->length > 0) {
+            $titles[] = trim($issuer->item(0)->nodeValue);
+        }
+        if (count($titles) >= 50) break;
+    }
+    if (empty($titles)) {
+        error_log("No titles extracted.");
+        return;
+    }
+    error_log("Extracted " . count($titles) . " IPO titles.");
+
+    $category = get_term_by('name', $category_name, 'category');
+    if (!$category) {
+        $new_category = wp_insert_term($category_name, 'category');
+        if (is_wp_error($new_category)) {
+            error_log("Category creation failed: " . $new_category->get_error_message());
+            return;
+        }
+        $category_id = $new_category['term_id'];
+        error_log("Category created with ID: " . $category_id);
+    } else {
+        $category_id = $category->term_id;
+        error_log("Category exists with ID: " . $category_id);
+    }
+
+    foreach ($titles as $title) {
+        $post_slug = str_replace(' ', '', $title);
+        $content_url = $cloudflare_base_url . $post_slug . ".html";
+
+        $content_response = wp_remote_get($content_url);
+        if (is_wp_error($content_response)) {
+            error_log("Failed to fetch content for $title: " . $content_response->get_error_message());
+            continue;
+        }
+        $post_content = wp_remote_retrieve_body($content_response);
+        if (!$post_content) {
+            error_log("Empty content for $title.");
+            continue;
+        }
+        error_log("Fetched content for: $title");
+
+        // 🔹 Use WP_Query to check if the post exists
+        $existing_post_query = new WP_Query([
+            'title'  => $title,
+            'post_type' => 'post',
+            'posts_per_page' => 1
+        ]);
+
+        if ($existing_post_query->have_posts()) {
+            $existing_post = $existing_post_query->posts[0];
+            $updated_post = wp_update_post([
+                'ID'           => $existing_post->ID,
+                'post_content' => $post_content,
+            ], true);
+            if (is_wp_error($updated_post)) {
+                error_log("Failed to update post for $title: " . $updated_post->get_error_message());
+            } else {
+                error_log("Updated post: $title (ID: " . $existing_post->ID . ")");
+            }
+        } else {
+            $new_post_id = wp_insert_post([
+                'post_title'   => $title,
+                'post_content' => $post_content,
+                'post_status'  => 'publish',
+                'post_author'  => 1,
+                'post_category' => [$category_id],
+            ], true);
+            if (is_wp_error($new_post_id)) {
+                error_log("Failed to create post for $title: " . $new_post_id->get_error_message());
+            } else {
+                error_log("Created post: $title (ID: " . $new_post_id . ")");
+            }
+        }
+    }
+
+    error_log("IPO Post Creation Completed.");
+}
+
+if (!wp_next_scheduled('schedule_ipo_posts')) {
+    wp_schedule_event(strtotime('tomorrow 00:30'), 'daily', 'schedule_ipo_posts');
+}
+add_action('schedule_ipo_posts', 'fetch_and_create_ipo_posts');
+
+function run_ipo_post_creation() {
+    fetch_and_create_ipo_posts();
+    return "IPO posts updated!";
+}
+add_shortcode('update_ipo_posts', 'run_ipo_post_creation');
